@@ -51,10 +51,13 @@ answers cause `juju deploy` to fail.
 4. **Does the Juju controller already exist, or does it need
    bootstrapping?** If bootstrapping is needed, the model's
    default-base may differ from per-app bases.
-5. **What version of Juju is on the controller, and what version is
-   the local client?** Run `juju version` locally and, if the
-   controller exists, `juju controllers --format=yaml` (look for
-   `agent-version`). This matters because:
+5. **What version of Juju is on the test controller, the local
+   client, and — if this is a customer reproduction — the customer's
+   environment?** Run `juju version` locally; if the test controller
+   exists, `juju controllers --format=yaml` (look for
+   `agent-version`); for the customer's version, check the ticket /
+   `juju status` output they provided or ask them to run
+   `juju version`. This matters because:
    - Juju **2.9.x** bundles use `series:` (e.g. `series: jammy`) and
      do not recognize the `base:` key.
    - Juju **3.x** bundles use `base:` (e.g.
@@ -64,7 +67,38 @@ answers cause `juju deploy` to fail.
      deploy` flags differ across the 2.9 ↔ 3.x line.
    - A client/controller version mismatch across that line can let
      the bundle parse client-side but fail at the controller.
-   If the user doesn't know, ask them to run `juju version`.
+   - **Bugs are version-specific.** LP#1982921 / LP#2054375 hit
+     particular Juju 3.x revisions; reproducing or dodging them
+     depends on the exact version in play.
+
+   **Strongly recommend matching the customer's Juju version on the
+   test controller** for reproducibility. The skill's job is to make
+   the bundle deploy cleanly in the engineer's *own* environment,
+   but if that environment runs a different Juju version than the
+   customer, behavior can diverge in ways that mislead the
+   investigation: a bundle that "works for the engineer" may still
+   be broken for the customer (or vice versa). Same charm revisions
+   + same bases + same Juju version = a deploy whose success or
+   failure is informative.
+
+   To bootstrap a controller at a specific Juju version:
+
+   ```bash
+   # Install the matching client first
+   sudo snap install juju --channel=<track>/stable --classic
+   # e.g. --channel=3.4/stable, 3.5/stable, 2.9/stable
+
+   # Then bootstrap pinned to that agent version
+   juju bootstrap <cloud> --agent-version=<X.Y.Z>
+   ```
+
+   If a controller already exists on a different version, either
+   bootstrap a fresh one at the matching version, or accept the
+   delta and **explicitly call it out in the final summary**
+   ("Reproduced on Juju 3.4.6; customer reports Juju 3.5.3 — minor
+   version delta, behavior likely but not guaranteed to match").
+   Never silently reproduce on a mismatched version; downstream
+   debugging conclusions depend on knowing this.
 6. **Are there resource constraints on the test cloud?**
    (e.g. limited RAM, smaller flavors, no LoadBalancer support, no
    block storage). Capture these — they affect `constraints:` and
@@ -181,11 +215,86 @@ Rules for picking the right combo:
 4. Pin the base/series **explicitly per application** — don't rely
    on `default-base:` / `default-series:`. Juju's inference is
    unreliable on OpenStack and other providers and is the cause of
-   most `series: <X> not supported` errors. Use the key that matches
-   the controller's Juju version (from Phase 0 Q5):
-   - **Juju 3.x:** `base: ubuntu@22.04/stable`
-   - **Juju 2.9.x:** `series: jammy`
-   Do **not** mix `base:` and `series:` in the same bundle.
+   most `series: <X> not supported` errors. Before choosing which
+   key to use, **scan the bundle for `revision:` pins** — their
+   presence interacts with a known Juju 3.x bug. Pick the key per
+   this matrix, then use it consistently throughout the bundle —
+   never mix `base:` and `series:` in the same bundle:
+
+   | Controller Juju version | Bundle pins `revision:`? | Use     |
+   |-------------------------|--------------------------|---------|
+   | 2.9.x                   | any                      | `series:` (e.g. `series: jammy`) |
+   | 3.x                     | no                       | `base:` (e.g. `base: ubuntu@22.04/stable`) |
+   | 3.x                     | **yes (any app)**        | `series:` (workaround — see note) |
+
+   **Juju 3.x + pinned revisions — known bug.** Bugs
+   [LP#1982921](https://bugs.launchpad.net/juju/+bug/1982921) and its
+   3.x regression
+   [LP#2054375](https://bugs.launchpad.net/juju/+bug/2054375) cause
+   the client to construct the `AddCharm` RPC from the bundle's
+   `series:` field rather than `base:` when any revision is pinned.
+   If `series:` is unset, the RPC is sent with no base at all and the
+   controller rejects it. The give-away in the change plan is a line
+   like:
+
+   ```
+   upload charm <name> from charm-hub with revision <N> with architecture=amd64
+   ```
+
+   …with **no `with base ...` clause**. The reliable workaround is to
+   author the bundle in `series:` form throughout. Juju 3.x still
+   accepts `series:` and routes it through a code path that doesn't
+   drop the value.
+
+   As a belt-and-braces safety net when forced onto `series:` for
+   this reason, you may also set `default-series: <X>` at the bundle
+   top level (and remove any `default-base:`). The per-app pin
+   remains authoritative; the top-level value just guarantees the
+   controller has a fallback if a future bug variant strips a
+   per-app value.
+5. **Pin the base/series on every entry in the `machines:` block
+   too.** Juju resolves the series in three independent layers, and
+   the top-level `default-series:` / `default-base:` applies *only
+   to applications*, never to machines:
+
+   | Layer | Controls | Falls back to if unset |
+   |-------|----------|------------------------|
+   | Per-app `series:` / `base:` | The unit's charm base | Top-level `default-series:` / `default-base:` |
+   | Top-level `default-series:` / `default-base:` | Default for apps without their own | (apps are the only consumers) |
+   | Per-machine `series:` / `base:` (in `machines:`) | The Ubuntu image to provision | **`juju model-config default-base`** (often `noble` on fresh models) |
+
+   If apps are pinned but machines are not, Juju provisions the
+   machines from the model's `default-base` and then refuses to bind
+   the pinned units to them, producing:
+
+   ```
+   base does not match: unit has "ubuntu@22.04", machine has "ubuntu@24.04"
+   ```
+
+   For every entry in the `machines:` block, set the **same key**
+   chosen in rule 4 — don't mix `base:` and `series:` across apps
+   and machines either. Example (assuming `series:` was chosen):
+
+   ```yaml
+   machines:
+     "0":
+       series: jammy
+       constraints: arch=amd64 mem=2048 root-disk=20480
+     "1":
+       series: jammy
+       constraints: arch=amd64 mem=4096
+   ```
+
+   **Optional belt-and-braces:** set the model default too, so any
+   machine added later (manually or by a different bundle in the
+   same model) doesn't inherit the wrong base:
+
+   ```bash
+   juju model-config default-base=ubuntu@22.04/stable
+   ```
+
+   The per-machine pin is authoritative; the model-config is just
+   defense against future surprises.
 
 Real-world examples:
 
@@ -212,7 +321,7 @@ Unless explicitly forced by the target cloud, do **not** modify:
 - `resources:` for machine charms (different from k8s image
   resources — preserve)
 - Cross-model `saas:` / `offers:` (ask before stripping; see Phase 0
-  question 8)
+  question 9)
 
 ### 1e. Constraints, only when needed
 
@@ -251,7 +360,15 @@ simplify, minimize, or extract a subset.** If they did, then:
 2. Visually confirm:
    - `bundle:` key is correct for the target (`kubernetes` for k8s
      target, omitted for machine target).
-   - Every application has `base:` set explicitly.
+   - Every application has `base:` *or* `series:` set explicitly
+     (per Phase 1c rule 4) — never both, and the same key is used
+     across every application in the bundle.
+   - **Every entry in the `machines:` block (if present) has the
+     same key (`base:` or `series:`) set explicitly, matching the
+     value used by the applications** (per Phase 1c rule 5). Bare
+     machine entries that look like `"0": {}` or `"0": {constraints: ...}`
+     with no `series:` / `base:` are the most common cause of unit→
+     machine base-mismatch errors.
    - Every channel was verified against the Charmhub API.
    - Every original relation is still present (unless explicitly
      dropped in Phase 2 trim, or forced out by a topology swap in
@@ -268,8 +385,13 @@ Return three things to the user:
    smallest diff and call out any forced changes:
    > Forced changes (target compatibility):
    > - Removed top-level `bundle: kubernetes` (target is OpenStack).
-   > - Pinned `base: ubuntu@22.04/stable` per app (target has no
-   >   noble image).
+   > - Pinned `series: jammy` per app **and** per entry in the
+   >   `machines:` block (target has no noble image; without the
+   >   machine-level pin, machines would inherit the model's
+   >   `default-base` and unit→machine binding would fail with
+   >   `base does not match`). Bundle uses `series:` rather than
+   >   `base:` because revisions are pinned and the controller is
+   >   on Juju 3.x — workaround for LP#1982921 / LP#2054375.
    > - `rabbitmq-server` channel `3.12/stable` → `3.9/stable`
    >   (3.12 publishes only for noble).
    >
@@ -284,12 +406,29 @@ Return three things to the user:
    > those external models first, or let me know if you'd like them
    > stubbed.
 
+   Always include a **Juju version line** in this section if the
+   test controller's version differs from the customer's, or if the
+   customer's version is unknown:
+
+   > Reproduced on Juju 3.4.6 (test controller). Customer version
+   > unknown — please confirm with `juju version` so we can verify
+   > the reproduction is on the right Juju revision.
+
+   Or:
+
+   > Reproduced on Juju 3.4.6. Customer reports Juju 3.5.3 — minor
+   > version delta; behavior likely but not guaranteed to match. If
+   > the customer's reproduction differs, re-test on a Juju 3.5.3
+   > controller.
+
 ## Known gotchas (verbatim error → fix)
 
-| Error message | Fix |
-|---------------|-----|
+| Error message / symptom | Fix |
+|-------------------------|-----|
 | `bundle has an invalid type "<X>"` | Remove the top-level `bundle:` key (only `kubernetes` is valid) |
-| `series: <X> not supported` | Pin `base:` per app to a base the chosen channel actually publishes; verify via Charmhub API |
+| `series: <X> not supported` | The chosen channel doesn't publish for that base. Verify via the Charmhub API, then pin the correct value per Phase 1c rule 4 (`base:` for Juju 3.x without revision pins, otherwise `series:`) |
+| Change-plan line `upload charm <X> from charm-hub with revision <N> with architecture=amd64` (no `with base ...`) | Juju 3.x bug LP#1982921 / LP#2054375 triggered by `revision:` + `base:` together. Switch the bundle from `base:` to `series:` throughout. See Phase 1c rule 4 |
+| `base does not match: unit has "<X>", machine has "<Y>"` | The `machines:` block has no per-machine `series:` / `base:`, so machines were provisioned from the model's `default-base` (often noble) while the apps are pinned elsewhere. Add the same `series:` / `base:` value to every entry in `machines:` (see Phase 1c rule 5). Also clean up any stale machines from prior failed deploys (`juju machines`, then `juju remove-machine <id> --force --no-wait` or destroy and recreate the model). Optionally `juju model-config default-base=ubuntu@22.04/stable` as belt-and-braces |
 | `cannot resolve charm: ... not found in <channel>` | Channel doesn't exist or has no revision for the target arch; query Charmhub API for actual channels |
 | `cannot deploy bundle: ... unit X already exists` | Stale model state from prior deploy; `juju remove-application` or use a fresh model |
 | `no matching agent binaries available` | Controller and model bases don't agree; check `juju model-config default-base` |
