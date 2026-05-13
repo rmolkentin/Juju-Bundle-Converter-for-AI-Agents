@@ -51,7 +51,21 @@ answers cause `juju deploy` to fail.
 4. **Does the Juju controller already exist, or does it need
    bootstrapping?** If bootstrapping is needed, the model's
    default-base may differ from per-app bases.
-5. **Are there resource constraints on the test cloud?**
+5. **What version of Juju is on the controller, and what version is
+   the local client?** Run `juju version` locally and, if the
+   controller exists, `juju controllers --format=yaml` (look for
+   `agent-version`). This matters because:
+   - Juju **2.9.x** bundles use `series:` (e.g. `series: jammy`) and
+     do not recognize the `base:` key.
+   - Juju **3.x** bundles use `base:` (e.g.
+     `base: ubuntu@22.04/stable`); `series:` is deprecated but still
+     parses.
+   - Default-base inference, channel resolution, and several `juju
+     deploy` flags differ across the 2.9 ↔ 3.x line.
+   - A client/controller version mismatch across that line can let
+     the bundle parse client-side but fail at the controller.
+   If the user doesn't know, ask them to run `juju version`.
+6. **Are there resource constraints on the test cloud?**
    (e.g. limited RAM, smaller flavors, no LoadBalancer support, no
    block storage). Capture these — they affect `constraints:` and
    may require softening (not removing) some config options.
@@ -61,34 +75,34 @@ answers cause `juju deploy` to fail.
 The default for every question below is **keep it**. Only deviate if
 the user explicitly asks.
 
-6. **Trim or preserve?** "Do you want to keep the entire bundle, or
+7. **Trim or preserve?** "Do you want to keep the entire bundle, or
    trim it to a subset of applications?" *Default: keep the entire
    bundle.* Only enter trim-mode if the user explicitly opts in and
    names the keep-list.
-7. **HA or single-unit?** Preserve the original `scale:` / `num_units:`
+8. **HA or single-unit?** Preserve the original `scale:` / `num_units:`
    values unless the user explicitly says "make it single-unit" or
    "this is just a test, drop replicas." Don't auto-shrink replica
    counts; the customer chose them for a reason.
-8. **Cross-model relations (`saas:` / `offers:`)?** If the source
+9. **Cross-model relations (`saas:` / `offers:`)?** If the source
    bundle uses them, ask: "This bundle has cross-model relations to
    external models. Do you have those external models available,
    or should I stub them out / convert to in-bundle apps?" Don't
    silently strip.
-9. **k8s ↔ machine?** If the source charm flavor (e.g. `*-k8s`)
-   doesn't match the target cloud type, a swap is forced. Tell the
-   user explicitly: "Source uses k8s charms; target is OpenStack.
-   I will swap to machine-mode equivalents — this changes the
-   topology slightly. OK to proceed?"
+10. **k8s ↔ machine?** If the source charm flavor (e.g. `*-k8s`)
+    doesn't match the target cloud type, a swap is forced. Tell the
+    user explicitly: "Source uses k8s charms; target is OpenStack.
+    I will swap to machine-mode equivalents — this changes the
+    topology slightly. OK to proceed?"
 
 ### C. Errors they've already hit (if any)
 
 Ask only if the user mentions a failed deploy. The error message
 determines which gotcha applies.
 
-10. **What is the exact error from `juju deploy`?** Paste verbatim.
-11. **Which phase failed?** Bundle parsing, charm resolution, machine
+11. **What is the exact error from `juju deploy`?** Paste verbatim.
+12. **Which phase failed?** Bundle parsing, charm resolution, machine
     provisioning, or unit-agent settle.
-12. **Have they tried `juju deploy --dry-run`?** It catches most
+13. **Have they tried `juju deploy --dry-run`?** It catches most
     issues earlier.
 
 ---
@@ -164,10 +178,14 @@ Rules for picking the right combo:
 3. If forced to change one, change the **base** first (keep the same
    charm version). Only change the **channel** as a last resort, and
    when you do, document it in the summary.
-4. Set `base:` **explicitly per application** — don't rely on
-   `default-base:`. Juju's inference is unreliable on OpenStack and
-   other providers and is the cause of most `series: <X> not supported`
-   errors.
+4. Pin the base/series **explicitly per application** — don't rely
+   on `default-base:` / `default-series:`. Juju's inference is
+   unreliable on OpenStack and other providers and is the cause of
+   most `series: <X> not supported` errors. Use the key that matches
+   the controller's Juju version (from Phase 0 Q5):
+   - **Juju 3.x:** `base: ubuntu@22.04/stable`
+   - **Juju 2.9.x:** `series: jammy`
+   Do **not** mix `base:` and `series:` in the same bundle.
 
 Real-world examples:
 
